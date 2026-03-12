@@ -12,6 +12,9 @@ logger = logging.getLogger(__name__)
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 DAILY_VARS = "temperature_2m_mean,precipitation_sum,relative_humidity_2m_mean"
 DEFAULT_DATA_PATH = "data/weather_state_weekly.csv"
+MAX_RETRIES = 3
+REQUEST_DELAY_SECONDS = 2
+RATE_LIMIT_BACKOFF_SECONDS = 30
 
 
 STATES = [
@@ -113,19 +116,34 @@ def fetch_daily_weather(start_date, end_date):
         params["start_date"] = start_date
         params["end_date"] = end_date
 
-        try:
-            payload = fetch_json(ARCHIVE_URL, params)
-        except requests.exceptions.ReadTimeout:
-            print(f"ReadTimeout for request: {state_row['state_abbr']} {start_date} to {end_date}")
+        payload = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                payload = fetch_json(ARCHIVE_URL, params)
+                break
+            except requests.exceptions.ReadTimeout:
+                print(
+                    f"ReadTimeout for request: {state_row['state_abbr']} {start_date} to {end_date}. "
+                    f"Retry {attempt}/{MAX_RETRIES}."
+                )
+                time.sleep(5)
+            except requests.exceptions.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 429:
+                    wait_seconds = RATE_LIMIT_BACKOFF_SECONDS * attempt
+                    print(
+                        f"429 Too Many Requests for request: {state_row['state_abbr']} {start_date} to {end_date}. "
+                        f"Retry {attempt}/{MAX_RETRIES} after {wait_seconds} seconds."
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                raise
+
+        if payload is None:
+            print(f"Skipping {state_row['state_abbr']} after {MAX_RETRIES} failed attempts.")
             continue
-        except requests.exceptions.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 429:
-                print(f"429 Too Many Requests for request: {state_row['state_abbr']} {start_date} to {end_date}. Waiting 10 seconds.")
-                time.sleep(10)
-                continue
-            raise
+
         rows.append(build_daily_frame(state_row, payload))
-        time.sleep(1)
+        time.sleep(REQUEST_DELAY_SECONDS)
 
     return pd.concat(rows, ignore_index=True)
 
