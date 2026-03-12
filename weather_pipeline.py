@@ -10,12 +10,8 @@ import requests
 logger = logging.getLogger(__name__)
 
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 DAILY_VARS = "temperature_2m_mean,precipitation_sum,relative_humidity_2m_mean"
 DEFAULT_DATA_PATH = "data/weather_state_weekly.csv"
-DEFAULT_PARQUET_PATH = "data/weather_state_weekly.parquet"
-DEFAULT_FORECAST_CSV = "data/weather_state_weekly_forecast.csv"
-DEFAULT_FORECAST_PARQUET = "data/weather_state_weekly_forecast.parquet"
 
 
 STATES = [
@@ -100,14 +96,13 @@ def build_daily_frame(state_row, payload):
     return df[["state", "state_abbr", "date", "temperature", "precipitation", "humidity"]]
 
 
-def fetch_daily_weather(start_date, end_date, source="archive"):
+def fetch_daily_weather(start_date, end_date):
     """Fetch daily weather for all 50 states."""
     states = get_states()
     rows = []
-    url = ARCHIVE_URL if source == "archive" else FORECAST_URL
 
     for _, state_row in states.iterrows():
-        logger.info("Fetching %s weather for %s", source, state_row["state_abbr"])
+        logger.info("Fetching weather for %s", state_row["state_abbr"])
         params = {
             "latitude": state_row["latitude"],
             "longitude": state_row["longitude"],
@@ -115,25 +110,17 @@ def fetch_daily_weather(start_date, end_date, source="archive"):
             "daily": DAILY_VARS,
         }
 
-        if source == "archive":
-            params["start_date"] = start_date
-            params["end_date"] = end_date
-        else:
-            start = pd.Timestamp(start_date)
-            end = pd.Timestamp(end_date)
-            today = pd.Timestamp(date.today())
-            forecast_days = max((end - today).days + 1, 1)
-            params["past_days"] = max((today - start).days, 0)
-            params["forecast_days"] = min(forecast_days, 16)
+        params["start_date"] = start_date
+        params["end_date"] = end_date
 
         try:
-            payload = fetch_json(url, params)
+            payload = fetch_json(ARCHIVE_URL, params)
         except requests.exceptions.ReadTimeout:
-            print(f"ReadTimeout for {source} request: {state_row['state_abbr']} {start_date} to {end_date}")
+            print(f"ReadTimeout for request: {state_row['state_abbr']} {start_date} to {end_date}")
             continue
         except requests.exceptions.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 429:
-                print(f"429 Too Many Requests for {source} request: {state_row['state_abbr']} {start_date} to {end_date}. Waiting 10 seconds.")
+                print(f"429 Too Many Requests for request: {state_row['state_abbr']} {start_date} to {end_date}. Waiting 10 seconds.")
                 time.sleep(10)
                 continue
             raise
@@ -158,14 +145,6 @@ def get_last_tuesday(day_value=None):
         day_value = date.today()
     days_back = (day_value.weekday() - 1) % 7
     return day_value - timedelta(days=days_back)
-
-
-def get_next_wednesday(day_value=None):
-    """Return the next Wednesday on or after a date."""
-    if day_value is None:
-        day_value = date.today()
-    days_forward = (2 - day_value.weekday()) % 7
-    return day_value + timedelta(days=days_forward)
 
 
 def daily_to_weekly(df):
@@ -209,39 +188,9 @@ def daily_to_weekly(df):
     ]
 
 
-def fetch_forecast_weekly(forecast_weeks):
-    """Fetch simple future weekly forecast features."""
-    if forecast_weeks <= 0:
-        return pd.DataFrame()
-
-    start_date = get_next_wednesday()
-    end_date = start_date + timedelta(days=forecast_weeks * 7 - 1)
-    max_end = date.today() + timedelta(days=15)
-    if end_date > max_end:
-        logger.info("Open-Meteo forecast only goes about 16 days ahead, so forecast was capped.")
-        end_date = max_end
-
-    daily = fetch_daily_weather(start_date.isoformat(), end_date.isoformat(), source="forecast")
-    daily = daily[daily["date"] >= pd.Timestamp(start_date)]
-    weekly = daily_to_weekly(daily)
-    weekly = weekly[weekly["week_start"] >= pd.Timestamp(start_date)].copy()
-    weekly = weekly.rename(
-        columns={
-            "temp_avg_week": "temp_avg_week_forecast",
-            "precip_total_week": "precip_total_week_forecast",
-            "humidity_avg_week": "humidity_avg_week_forecast",
-        }
-    )
-    return weekly
-
-
-def load_weekly_data(csv_path, parquet_path):
+def load_weekly_data(csv_path):
     """Load an existing weekly dataset."""
     csv_file = Path(csv_path)
-    parquet_file = Path(parquet_path)
-
-    if parquet_file.exists():
-        return pd.read_parquet(parquet_file)
     if csv_file.exists():
         return pd.read_csv(csv_file, parse_dates=["week_start", "week_end"])
     return pd.DataFrame()
@@ -276,11 +225,8 @@ def combine_weekly_data(old_df, new_df):
     return combined[keep_columns]
 
 
-def save_data(df, csv_path, parquet_path):
-    """Save a dataframe to CSV and Parquet."""
+def save_data(df, csv_path):
+    """Save a dataframe to CSV."""
     Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(parquet_path).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(csv_path, index=False)
-    df.to_parquet(parquet_path, index=False)
     logger.info("Saved %s", csv_path)
-    logger.info("Saved %s", parquet_path)
