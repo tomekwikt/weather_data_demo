@@ -27,10 +27,12 @@ jobs:
         run: |
           python update_weather.py
 
+  
       - name: Commit updated weather files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/weather_state_weekly.csv
+          git add data/weather_state_weekly.csv data/weather_state_weekly.parquet
           git diff --cached --quiet || git commit -m "chore: weekly weather update"
-          git push
+          git pull --rebase origin main
+          git push origin main
