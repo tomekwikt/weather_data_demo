@@ -26,7 +26,7 @@ jobs:
 
       - name: Run weekly weather update
         run: |
-          python update_weather_data.py
+          python update_weather.py
 
       - name: Commit updated weather files
         run: |
