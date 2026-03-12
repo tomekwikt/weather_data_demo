@@ -2,9 +2,8 @@ name: Weekly Weather Update
 
 on:
   schedule:
-    # Every Saturday at 10:00 UTC
-    - cron: "0 10 * * 6"
-  workflow_dispatch:
+    # Every Wednesday at 10:00 UTC
+    - cron: "0 10 * * 3"
 
 jobs:
   update-weather:
