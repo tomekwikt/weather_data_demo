@@ -2,7 +2,6 @@ name: Weekly Weather Update
 
 on:
   schedule:
-    # Every Wednesday at 10:00 UTC
     - cron: "0 10 * * 3"
   workflow_dispatch:
 
@@ -35,7 +34,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/weather_state_weekly.csv data/weather_state_weekly.parquet
+          git add data/weather_state_weekly.csv
           git diff --cached --quiet || git commit -m "chore: weekly weather update"
-          git pull --rebase origin main
-          git push origin main
+          git push
