@@ -10,11 +10,26 @@ import requests
 logger = logging.getLogger(__name__)
 
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
-DAILY_VARS = "temperature_2m_mean,precipitation_sum,relative_humidity_2m_mean"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+ARCHIVE_DAILY_VARS = "temperature_2m_mean,precipitation_sum,relative_humidity_2m_mean"
+FORECAST_DAILY_VARS = "temperature_2m_mean,precipitation_sum"
+HOURLY_HUMIDITY_VAR = "relative_humidity_2m"
 DEFAULT_DATA_PATH = "data/weather_state_weekly.csv"
-MAX_RETRIES = 3
-REQUEST_DELAY_SECONDS = 2
-RATE_LIMIT_BACKOFF_SECONDS = 30
+WEEKLY_DATA_COLUMNS = [
+    "state_abbr",
+    "week_start",
+    "week_end",
+    "week",
+    "temp_avg_week",
+    "precip_total_week",
+    "humidity_avg_week",
+    "data_type",
+]
+UNIQUE_WEEK_COLUMNS = ["state_abbr", "week_start", "week_end"]
+DATA_TYPE_PRIORITY = {"forecast": 0, "observed": 1}
+MAX_RETRIES = 5
+REQUEST_DELAY_SECONDS = 1
+BASE_BACKOFF_SECONDS = 5
 
 
 STATES = [
@@ -77,71 +92,111 @@ def get_states():
 
 
 def fetch_json(url, params):
-    """Run one API request and return the JSON."""
-    response = requests.get(url, params=params, timeout=120)
-    response.raise_for_status()
-    return response.json()
+    """Run one API request with retry/backoff and return the JSON."""
+    last_exception = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.get(url, params=params, timeout=120)
+            response.raise_for_status()
+            return response.json()
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as exc:
+            last_exception = exc
+            wait_seconds = BASE_BACKOFF_SECONDS * attempt
+            logger.warning("Request failed (%s). Retry %s/%s in %ss.", exc.__class__.__name__, attempt, MAX_RETRIES, wait_seconds)
+            time.sleep(wait_seconds)
+        except requests.exceptions.HTTPError as exc:
+            last_exception = exc
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code == 429 or (status_code is not None and 500 <= status_code < 600):
+                wait_seconds = BASE_BACKOFF_SECONDS * attempt
+                logger.warning(
+                    "HTTP %s from Open-Meteo. Retry %s/%s in %ss.",
+                    status_code,
+                    attempt,
+                    MAX_RETRIES,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+                continue
+            raise
+
+    raise RuntimeError(f"Open-Meteo request failed after {MAX_RETRIES} attempts: {last_exception}") from last_exception
+
+
+def hourly_to_daily_humidity(payload):
+    """Aggregate hourly humidity into daily mean humidity for fallback use."""
+    hourly = payload.get("hourly") or {}
+    hourly_times = hourly.get("time")
+    humidity_values = hourly.get(HOURLY_HUMIDITY_VAR)
+    if not hourly_times or humidity_values is None:
+        return pd.DataFrame(columns=["date", "humidity"])
+
+    hourly_df = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(hourly_times),
+            "humidity": pd.to_numeric(humidity_values, errors="coerce"),
+        }
+    )
+    hourly_df["date"] = hourly_df["timestamp"].dt.floor("D")
+    return hourly_df.groupby("date", as_index=False)["humidity"].mean()
 
 
 def build_daily_frame(state_row, payload):
-    """Turn one Open-Meteo response into daily rows."""
+    """Turn one Open-Meteo response into daily rows, preserving humidity fallback."""
     daily = payload["daily"]
     df = pd.DataFrame(
         {
             "date": pd.to_datetime(daily["time"]),
             "temperature": pd.to_numeric(daily["temperature_2m_mean"], errors="coerce"),
             "precipitation": pd.to_numeric(daily["precipitation_sum"], errors="coerce"),
-            "humidity": pd.to_numeric(daily["relative_humidity_2m_mean"], errors="coerce"),
         }
     )
+
+    if "relative_humidity_2m_mean" in daily:
+        df["humidity"] = pd.to_numeric(daily["relative_humidity_2m_mean"], errors="coerce")
+    else:
+        df["humidity"] = pd.NA
+
+    # Open-Meteo sometimes exposes humidity only hourly. Fill daily gaps from hourly means.
+    hourly_humidity = hourly_to_daily_humidity(payload)
+    if not hourly_humidity.empty:
+        df = df.merge(hourly_humidity, on="date", how="left", suffixes=("", "_hourly"))
+        df["humidity"] = df["humidity"].fillna(df["humidity_hourly"])
+        df = df.drop(columns=["humidity_hourly"])
+
     df["state"] = state_row["state"]
     df["state_abbr"] = state_row["state_abbr"]
     return df[["state", "state_abbr", "date", "temperature", "precipitation", "humidity"]]
 
 
-def fetch_daily_weather(start_date, end_date):
-    """Fetch daily weather for all 50 states."""
+def fetch_daily_weather(start_date, end_date, *, source):
+    """Fetch daily weather for all 50 states from archive or forecast."""
+    if source == "observed":
+        url = ARCHIVE_URL
+        daily_vars = ARCHIVE_DAILY_VARS
+    elif source == "forecast":
+        url = FORECAST_URL
+        daily_vars = FORECAST_DAILY_VARS
+    else:
+        raise ValueError(f"Unsupported weather source: {source}")
+
     states = get_states()
     rows = []
 
     for _, state_row in states.iterrows():
-        logger.info("Fetching weather for %s", state_row["state_abbr"])
+        logger.info("Fetching %s weather for %s", source, state_row["state_abbr"])
         params = {
             "latitude": state_row["latitude"],
             "longitude": state_row["longitude"],
             "timezone": "America/New_York",
-            "daily": DAILY_VARS,
+            "daily": daily_vars,
+            "hourly": HOURLY_HUMIDITY_VAR,
+            "start_date": start_date,
+            "end_date": end_date,
         }
 
-        params["start_date"] = start_date
-        params["end_date"] = end_date
-
-        payload = None
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                payload = fetch_json(ARCHIVE_URL, params)
-                break
-            except requests.exceptions.ReadTimeout:
-                print(
-                    f"ReadTimeout for request: {state_row['state_abbr']} {start_date} to {end_date}. "
-                    f"Retry {attempt}/{MAX_RETRIES}."
-                )
-                time.sleep(5)
-            except requests.exceptions.HTTPError as exc:
-                if exc.response is not None and exc.response.status_code == 429:
-                    wait_seconds = RATE_LIMIT_BACKOFF_SECONDS * attempt
-                    print(
-                        f"429 Too Many Requests for request: {state_row['state_abbr']} {start_date} to {end_date}. "
-                        f"Retry {attempt}/{MAX_RETRIES} after {wait_seconds} seconds."
-                    )
-                    time.sleep(wait_seconds)
-                    continue
-                raise
-
-        if payload is None:
-            print(f"Skipping {state_row['state_abbr']} after {MAX_RETRIES} failed attempts.")
-            continue
-
+        payload = fetch_json(url, params)
         rows.append(build_daily_frame(state_row, payload))
         time.sleep(REQUEST_DELAY_SECONDS)
 
@@ -165,20 +220,28 @@ def get_last_tuesday(day_value=None):
     return day_value - timedelta(days=days_back)
 
 
-def daily_to_weekly(df):
-    """Aggregate daily weather into weekly state rows."""
+def normalize_weekly_schema(df):
+    """Bring legacy weekly data into the new schema without changing row grain."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=WEEKLY_DATA_COLUMNS)
+
+    normalized = df.copy()
+    normalized = normalized.drop(columns=["state", "year", "pulled_at"], errors="ignore")
+    normalized["week_start"] = pd.to_datetime(normalized["week_start"])
+    normalized["week_end"] = pd.to_datetime(normalized["week_end"])
+
+    if "data_type" not in normalized.columns:
+        normalized["data_type"] = "observed"
+    normalized["data_type"] = normalized["data_type"].fillna("observed")
+    normalized = normalized.drop(columns=["generated_at"], errors="ignore")
+
+    return normalized[WEEKLY_DATA_COLUMNS]
+
+
+def daily_to_weekly(df, *, data_type):
+    """Aggregate daily weather into weekly state rows with row metadata."""
     if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "state_abbr",
-                "week_start",
-                "week_end",
-                "week",
-                "temp_avg_week",
-                "precip_total_week",
-                "humidity_avg_week",
-            ]
-        )
+        return pd.DataFrame(columns=WEEKLY_DATA_COLUMNS)
 
     df = add_week_columns(df)
     weekly = (
@@ -193,17 +256,8 @@ def daily_to_weekly(df):
 
     week_info = weekly["week_end"].dt.isocalendar()
     weekly["week"] = week_info.week.astype(int)
-    return weekly[
-        [
-            "state_abbr",
-            "week_start",
-            "week_end",
-            "week",
-            "temp_avg_week",
-            "precip_total_week",
-            "humidity_avg_week",
-        ]
-    ]
+    weekly["data_type"] = data_type
+    return weekly[WEEKLY_DATA_COLUMNS]
 
 
 def load_weekly_data(csv_path):
@@ -211,40 +265,63 @@ def load_weekly_data(csv_path):
     csv_file = Path(csv_path)
     if csv_file.exists():
         return pd.read_csv(csv_file, parse_dates=["week_start", "week_end"])
-    return pd.DataFrame()
+    return pd.DataFrame(columns=WEEKLY_DATA_COLUMNS)
 
 
 def combine_weekly_data(old_df, new_df):
-    """Append new weeks and keep one row per state-week."""
-    keep_columns = [
-        "state_abbr",
-        "week_start",
-        "week_end",
-        "week",
-        "temp_avg_week",
-        "precip_total_week",
-        "humidity_avg_week",
-    ]
+    """Merge weekly rows, replacing same-week forecasts with observations."""
+    old_df = normalize_weekly_schema(old_df)
+    new_df = normalize_weekly_schema(new_df)
 
-    old_df = old_df.copy()
-    new_df = new_df.copy()
-    old_df = old_df.drop(columns=["state", "year", "pulled_at"], errors="ignore")
-    new_df = new_df.drop(columns=["state", "year", "pulled_at"], errors="ignore")
+    combined = pd.concat([old_df, new_df], ignore_index=True)
+    combined["data_type_priority"] = combined["data_type"].map(DATA_TYPE_PRIORITY).fillna(-1)
 
-    if old_df.empty:
-        combined = new_df.copy()
-    else:
-        combined = pd.concat([old_df, new_df], ignore_index=True)
-
-    combined["week_start"] = pd.to_datetime(combined["week_start"])
-    combined["week_end"] = pd.to_datetime(combined["week_end"])
-    combined = combined.drop_duplicates(subset=["state_abbr", "week_start"], keep="last")
+    # For each state-week, keep observed rows ahead of forecast rows. For duplicates with the
+    # same data_type, keep the later row from the concat so reruns overwrite older values safely.
+    combined = combined.sort_values(
+        UNIQUE_WEEK_COLUMNS + ["data_type_priority"],
+        ascending=[True, True, True, True],
+        kind="mergesort",
+    )
+    combined = combined.drop_duplicates(subset=UNIQUE_WEEK_COLUMNS, keep="last")
+    combined = combined.drop(columns=["data_type_priority"])
     combined = combined.sort_values(["state_abbr", "week_start"]).reset_index(drop=True)
-    return combined[keep_columns]
+    return combined[WEEKLY_DATA_COLUMNS]
+
+
+def next_forecast_window(latest_observed_week_end):
+    """Return the next Wednesday-to-Tuesday week immediately after the latest observed week."""
+    week_start = pd.Timestamp(latest_observed_week_end) + pd.Timedelta(days=1)
+    week_end = week_start + pd.Timedelta(days=6)
+    return week_start.date(), week_end.date()
+
+
+def enforce_single_forecast_week(df, forecast_week_start, forecast_week_end):
+    """Keep only the target forecast week while preserving all observed history."""
+    weekly = normalize_weekly_schema(df)
+    forecast_week_start = pd.Timestamp(forecast_week_start)
+    forecast_week_end = pd.Timestamp(forecast_week_end)
+
+    observed = weekly.loc[weekly["data_type"] != "forecast"]
+    forecast = weekly.loc[
+        (weekly["data_type"] == "forecast")
+        & (weekly["week_start"] == forecast_week_start)
+        & (weekly["week_end"] == forecast_week_end)
+    ]
+    return (
+        pd.concat([observed, forecast], ignore_index=True)
+        .sort_values(["state_abbr", "week_start"])
+        .reset_index(drop=True)[WEEKLY_DATA_COLUMNS]
+    )
 
 
 def save_data(df, csv_path):
-    """Save a dataframe to CSV."""
-    Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(csv_path, index=False)
-    logger.info("Saved %s", csv_path)
+    """Save weekly data to CSV and parquet side by side."""
+    output = normalize_weekly_schema(df)
+    csv_file = Path(csv_path)
+    parquet_file = csv_file.with_suffix(".parquet")
+
+    csv_file.parent.mkdir(parents=True, exist_ok=True)
+    output.to_csv(csv_file, index=False)
+    output.to_parquet(parquet_file, index=False)
+    logger.info("Saved %s and %s", csv_file, parquet_file)

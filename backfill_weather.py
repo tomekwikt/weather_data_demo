@@ -18,8 +18,8 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-    daily = fetch_daily_weather(args.start_date, args.end_date)
-    weekly = daily_to_weekly(daily)
+    daily = fetch_daily_weather(args.start_date, args.end_date, source="observed")
+    weekly = daily_to_weekly(daily, data_type="observed")
     save_data(weekly, args.csv_path)
 
 
